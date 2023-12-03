@@ -1,32 +1,56 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-
 export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	// MY_DURABLE_OBJECT: DurableObjectNamespace;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
+	BATCHER: DurableObjectNamespace;
 }
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		return new Response('Hello World!');
+		let id = env.BATCHER.idFromName('foo');
+		return await env.BATCHER.get(id).fetch(request);
 	},
 };
+
+const SECONDS = 1000;
+
+export class Batcher {
+	state: DurableObjectState;
+	storage: DurableObjectStorage;
+	count: number = 0;
+
+	constructor(state: DurableObjectState, env: Env) {
+		this.state = state;
+		this.storage = state.storage;
+		this.state.blockConcurrencyWhile(async () => {
+			let vals = await this.storage.list({ reverse: true, limit: 1 });
+			this.count = vals.size == 0 ? 0 : parseInt(vals.keys().next().value);
+		});
+		console.log('Batcher:> Initializing DO');
+	}
+
+	async fetch(request: Request) {
+		this.count++;
+
+		// If there is no alarm currently set, set one for 10 seconds from now
+		// Any further POSTs in the next 10 seconds will be part of this batch.
+		let currentAlarm = await this.storage.getAlarm();
+		if (currentAlarm == null) {
+			this.storage.setAlarm(Date.now() + 2 * SECONDS);
+		}
+
+		console.log('Batcher:> Current alarm %s', await this.storage.getAlarm());
+
+		// Add the request to the batch.
+		await this.storage.put(this.count.toString(), await request.text());
+		return new Response(JSON.stringify({ queued: this.count }), {
+			headers: {
+				'content-type': 'application/json;charset=UTF-8',
+			},
+		});
+	}
+
+	async alarm() {
+		let vals = await this.storage.list();
+		console.log('Batcher:> Values %s', Array.from(vals.values()));
+		await this.storage.deleteAll();
+		this.count = 0;
+	}
+}
